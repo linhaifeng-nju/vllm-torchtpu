@@ -2,11 +2,12 @@
 
 Speculative decoding accelerates token generation (reducing median TPOT and end-to-end latency) by proposing `K` draft tokens per step and verifying them in parallel in a single target-model forward pass.
 
-`vllm-torchtpu` supports six speculative decoding methods on Cloud TPU (`tests/entrypoints/llm/test_speculative_decoding.py`):
+`vllm-torchtpu` supports the following speculative decoding methods on Cloud TPU (`tests/entrypoints/llm/test_speculative_decoding.py`):
 
 | Method | `--speculative-config` `"method"` | Requires Draft Checkpoint? | Best For |
 | :--- | :--- | :--- | :--- |
 | **EAGLE-3** | `"eagle3"` | Yes (`yuhuili/EAGLE3-*`) | High acceptance rates across general chat, coding, and reasoning tasks. |
+| **Standalone draft** | `"draft_model"` | Yes (an ordinary causal language model) | Reusing a smaller checkpoint without training a speculative head. |
 | **Multi-Token Prediction (MTP)** | `"mtp"` (or `"qwen3_next_mtp"`) | Built into checkpoint (`Qwen3.5`, `DeepSeek-V3/R1`, `GLM-5`) | Models trained with native MTP heads; zero external draft model management. |
 | **DFlash** | `"dflash"` | Yes (`z-lab/*-DFlash-*`) | Block-diffusion draft heads proposing up to 16 tokens in a single forward pass (`Qwen3`, `Qwen3.5`). |
 | **DSpark** | `"dspark"` | Yes (`deepseek-ai/dspark_*`, `Inferact/Kimi-K3-DSpark`), or built into the checkpoint (`DeepSeek-V4`) | Semi-autoregressive parallel block drafting (DFlash-style non-causal block forward conditioned on target auxiliary hidden states, followed by a sequential Markov head) (`Qwen3`, `DeepSeek-V4`, `Kimi-K3`); optional adaptive verification. |
@@ -133,3 +134,30 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
     "num_speculative_tokens": 5
   }'
 ```
+
+---
+
+## 5. Standalone Draft Model
+
+Use a smaller causal model with independent weights and KV cache to propose
+tokens for the target to verify.
+
+```bash
+vllm serve Qwen/Qwen3-32B \
+  --tensor-parallel-size 8 \
+  --max-model-len 8192 \
+  --async-scheduling \
+  --enable-prefix-caching \
+  --speculative-config '{
+    "method": "draft_model",
+    "model": "Qwen/Qwen3-0.6B",
+    "num_speculative_tokens": 3
+  }'
+```
+
+The draft needs attention KV and a matching token vocabulary. Draft TP defaults
+to target TP and can be set to 1. EP-coupled DP remains unverified.
+
+Set `draft_sample_method="probabilistic"` to sample proposals with request
+temperature, top-k, and top-p. This retains draft probabilities in memory.
+Non-greedy requests support the server-level `--seed` only.

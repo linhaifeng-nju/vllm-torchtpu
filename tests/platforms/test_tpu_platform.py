@@ -431,6 +431,25 @@ class TestTpuPlatform:
         with pytest.raises(NotImplementedError, match="rejection_sample_method"):
             TpuPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize("method", ["eagle3", "draft_model", "ngram"])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_async_model_based_speculation(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, method
+    ):
+        spec = MagicMock(method=method, rejection_sample_method="standard")
+        spec.use_eagle.return_value = method == "eagle3"
+        spec.uses_draft_model.return_value = method == "draft_model"
+        vllm_config.speculative_config = spec
+        vllm_config.scheduler_config.async_scheduling = True
+        if method == "ngram":
+            with pytest.raises(NotImplementedError, match="Async scheduling"):
+                TpuPlatform.check_and_update_config(vllm_config)
+        else:
+            TpuPlatform.check_and_update_config(vllm_config)
+
     @pytest.mark.parametrize(
         ("mamba_cache_mode", "speculative_config", "async_scheduling", "message"),
         [

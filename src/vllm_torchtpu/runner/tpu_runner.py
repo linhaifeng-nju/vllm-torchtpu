@@ -214,6 +214,7 @@ from vllm_torchtpu.spec_decode.adaptive_verification import (
     StepCostTable,
 )
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+from vllm_torchtpu.spec_decode.draft_model import DraftModelProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.utils import (
@@ -744,7 +745,7 @@ class TPUModelRunner(GPUModelRunner):
 
     @property
     def _is_async_drafter(self) -> bool:
-        """Whether this worker runs a hidden-state drafter.
+        """Whether this worker runs a model-based drafter.
 
         Under a pipeline only the last stage samples, so only it hosts the
         draft; the other stages hand their hidden states on and never draft.
@@ -754,6 +755,7 @@ class TPUModelRunner(GPUModelRunner):
         return (
             self.speculative_config.use_eagle()
             or self.speculative_config.method == "dflash"
+            or self.speculative_config.uses_draft_model()
         )
 
     @property
@@ -829,8 +831,26 @@ class TPUModelRunner(GPUModelRunner):
             normalize_draft_config(
                 vllm_config.speculative_config.draft_model_config.hf_config
             )
+        parent_config = vllm_config
+        spec = vllm_config.speculative_config
+        if (
+            spec is not None
+            and spec.uses_draft_model()
+            and spec.draft_tensor_parallel_size == 1
+            and vllm_config.parallel_config.tensor_parallel_size > 1
+        ):
+            # Parent init constructs a CUDA drafter that we discard below. Its
+            # CUDA compile-cache guard rejects replicated drafts. Keep its
+            # temporary allocation config TP-matched; TPU loading uses the
+            # original config and its separate draft compilation prefix.
+            parent_config = copy.copy(vllm_config)
+            parent_config.speculative_config = copy.copy(spec)
+            parent_config.speculative_config.draft_parallel_config = (
+                spec.target_parallel_config
+            )
         with _torch_tpu_wrapper():
-            super().__init__(vllm_config, device)
+            super().__init__(parent_config, device)
+        self.vllm_config = vllm_config
         self.pcp_manager = pcp_manager
         self.sequence_layout_planner = sequence_layout_planner
         _validate_libtpu_version()
@@ -1514,6 +1534,8 @@ class TPUModelRunner(GPUModelRunner):
             )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.uses_draft_model():
+                self.drafter = DraftModelProposer(self, self.vllm_config)
             elif self.speculative_config.method == "dflash":
                 self.drafter = DFlashProposer(self, self.vllm_config)
             elif self.speculative_config.method == "dspark":
@@ -3098,6 +3120,13 @@ class TPUModelRunner(GPUModelRunner):
         """
         if drafts is None:
             return None
+        if (
+            isinstance(self.drafter, DraftModelProposer)
+            and self.drafter.speculative_config.draft_sample_method == "probabilistic"
+        ):
+            # Each step already pins both the proposal and its distribution,
+            # including the steps replayed by idle DP ranks.
+            return drafts
         if isinstance(drafts, list):
             return [self._sync_one_replicated_draft(d) for d in drafts]
         if not isinstance(drafts, torch.Tensor):
@@ -5618,6 +5647,16 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates=topk_candidates,
             target_argmax=target_argmax,
             apply_topk_topp=apply_topk_topp,
+            draft_probs=(
+                self.drafter.get_draft_probs(
+                    self.input_batch.req_ids[cur_start_idx:cur_end_idx],
+                    md.segment_ids,
+                    md.group_indices,
+                    md.draft_lengths_cpu,
+                )
+                if do_sampling and isinstance(self.drafter, DraftModelProposer)
+                else None
+            ),
         )
         for proc in processors:
             proc.finish(next_tokens)

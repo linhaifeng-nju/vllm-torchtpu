@@ -3946,7 +3946,22 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
             _assert_same_logprobs_lists(deferred.logprobs, synchronous.logprobs)
 
 
-def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
+@pytest.mark.parametrize("method", ["greedy", "probabilistic"])
+def test_standalone_async_drafts_are_not_synchronized_twice(method):
+    drafter = object.__new__(tpu_runner.DraftModelProposer)
+    drafter.speculative_config = SimpleNamespace(draft_sample_method=method)
+    drafts = torch.tensor([[1, 2, 3]], dtype=torch.int32)
+    pin = MagicMock(side_effect=lambda tokens: tokens)
+    runner = SimpleNamespace(drafter=drafter, _sync_one_replicated_draft=pin)
+
+    assert TPUModelRunner._sync_replicated_drafts_across_tp(runner, drafts) is drafts
+    assert pin.call_count == (1 if method == "greedy" else 0)
+
+
+@pytest.mark.parametrize("probabilistic_draft", [False, True])
+def test_runner_sampling_paths_draw_float32_uniform_noise(
+    monkeypatch, probabilistic_draft
+):
     """All TPUModelRunner call sites into sample_from_logits_func must draw
     uniform random noise `u` in float32 even when logits are bfloat16."""
     monkeypatch.setattr(
@@ -3982,9 +3997,18 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
 
     def fake_rejection_sampler(**kwargs):
         seen_recover_dtypes.append(kwargs["recover_u"].dtype)
+        assert kwargs["draft_probs"] is draft_probs
         return torch.zeros((2, 2), dtype=torch.int32)
 
+    drafter = None
+    draft_probs = None
+    if probabilistic_draft:
+        drafter = object.__new__(tpu_runner.DraftModelProposer)
+        draft_probs = torch.full((2, 16), 1 / 16)
+        drafter.get_draft_probs = MagicMock(return_value=draft_probs)
     spec_runner = SimpleNamespace(
+        drafter=drafter,
+        input_batch=SimpleNamespace(req_ids=["first", "second"]),
         spec_gather_bonus_and_target_logits=lambda logits, b_idx, t_idx: (
             bf16_logits,
             bf16_logits,
@@ -4005,6 +4029,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         target_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
         draft_token_ids=torch.zeros((2,), dtype=torch.int32),
         draft_lengths=torch.ones((2,), dtype=torch.int32),
+        draft_lengths_cpu=np.ones(2, dtype=np.int32),
         segment_ids=torch.tensor([0, 1], dtype=torch.int32),
         group_indices=torch.tensor([[0], [1]], dtype=torch.int32),
     )
@@ -4021,6 +4046,10 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     )
     assert seen_u_dtypes == [torch.float32]
     assert seen_recover_dtypes == [torch.float32]
+    if probabilistic_draft:
+        drafter.get_draft_probs.assert_called_once_with(
+            ["first", "second"], md.segment_ids, md.group_indices, md.draft_lengths_cpu
+        )
     seen_u_dtypes.clear()
 
     # 3 & 4. sample_tokens (both non-speculative and speculative non-verify chunk)
