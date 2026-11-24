@@ -1884,8 +1884,15 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch, method)
         wrapper_configs.append(vllm_config)
         yield
 
+    monkeypatch.setattr(e3, "get_model_loader", lambda _cfg: _Loader())
     monkeypatch.setattr(
-        "vllm.model_executor.model_loader.get_model_loader", lambda _cfg: _Loader()
+        e3,
+        "get_model",
+        lambda *, vllm_config, prefix: _Loader().load_model(
+            vllm_config=vllm_config,
+            model_config=vllm_config.model_config,
+            prefix=prefix,
+        ),
     )
     monkeypatch.setattr(e3, "set_model_tag", lambda _tag: contextlib.nullcontext())
     monkeypatch.setattr(

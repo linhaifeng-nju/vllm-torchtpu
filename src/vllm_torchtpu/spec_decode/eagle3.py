@@ -861,6 +861,7 @@ class Eagle3Proposer:
 
     def _load_draft_model(self, target_model: torch.nn.Module | None = None) -> None:
         logger.info("Loading %s draft model...", self.speculative_config.method)
+        model_loader = get_model_loader(self.vllm_config.load_config)
         # Tag the draft compile with "eagle_head" so its torch.compile cache
         # lives in a separate prefix from the target's "backbone" prefix.
         draft_tp1_ctx = (
@@ -869,8 +870,7 @@ class Eagle3Proposer:
         self.draft_vllm_config = copy.copy(self.vllm_config)
         draft_model_config = copy.copy(self.speculative_config.draft_model_config)
         draft_model_config.runner_type = "draft"
-        standalone = self.speculative_config.uses_draft_model()
-        if standalone:
+        if self.speculative_config.uses_draft_model():
             self.draft_vllm_config.model_config = draft_model_config
             # A shallow copy does not rerun VllmConfig's quantization setup.
             self.draft_vllm_config.quant_config = VllmConfig.get_quantization_config(
@@ -898,15 +898,16 @@ class Eagle3Proposer:
                 and self._draft_tp_matches_target
             ):
                 self.draft_model = self._load_mtp_draft_sharing_head(
-                    get_model_loader(self.vllm_config.load_config),
-                    draft_model_config,
-                    target_model,
+                    model_loader, draft_model_config, target_model
+                )
+            elif self.speculative_config.uses_draft_model():
+                self.draft_model = get_model(
+                    vllm_config=self.draft_vllm_config, prefix="draft_model"
                 )
             else:
-                self.draft_model = get_model(
+                self.draft_model = model_loader.load_model(
                     vllm_config=self.draft_vllm_config,
                     model_config=draft_model_config,
-                    prefix="draft_model" if standalone else "",
                 )
 
     def _load_mtp_draft_sharing_head(

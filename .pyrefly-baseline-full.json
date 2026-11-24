@@ -1412,6 +1412,16 @@
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
+      "name": "unexpected-keyword",
+      "concise_description": "Unexpected keyword argument `vllm_config`"
+    },
+    {
+      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
+      "name": "unexpected-keyword",
+      "concise_description": "Unexpected keyword argument `model_config`"
+    },
+    {
+      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
       "name": "unbound-name",
       "concise_description": "`next_token_ids_np` may be uninitialized"
     },
