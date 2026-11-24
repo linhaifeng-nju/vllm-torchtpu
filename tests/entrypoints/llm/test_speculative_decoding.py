@@ -500,10 +500,13 @@ def _test_correctness_helper(
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.nightly
 @pytest.mark.multichip
-@pytest.mark.parametrize("num_speculative_tokens", [1, 3])
-@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize(
+    "num_speculative_tokens", [pytest.param(1, marks=pytest.mark.nightly), 3]
+)
+@pytest.mark.parametrize(
+    "async_scheduling", [pytest.param(False, marks=pytest.mark.nightly), True]
+)
 def test_standalone_draft_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -525,10 +528,9 @@ def test_standalone_draft_correctness_greedy(
     )
 
 
-@pytest.mark.nightly
 @pytest.mark.multichip
 @pytest.mark.timeout(2400)
-@pytest.mark.parametrize("draft_tp", [1, None])
+@pytest.mark.parametrize("draft_tp", [pytest.param(1, marks=pytest.mark.nightly), None])
 def test_standalone_probabilistic_mixed_sampling(draft_tp):
     """Retained proposal probabilities survive mixed sampling and cached requests."""
     model = "Qwen/Qwen3-0.6B"
