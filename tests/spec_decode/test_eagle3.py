@@ -187,10 +187,12 @@ def test_draft_tp_invalid_raises(draft_tp):
         _make_proposer(draft_tp=draft_tp, target_tp=8)
 
 
-def test_standalone_draft_keeps_own_embedding_and_head(monkeypatch):
-    proposer = _make_proposer(method="draft_model")
+@pytest.mark.parametrize("draft_tp", [1, 8])
+def test_standalone_draft_keeps_own_embedding_and_head(monkeypatch, draft_tp):
+    proposer = _make_proposer(draft_tp=draft_tp, target_tp=8, method="draft_model")
     draft, target = _make_vocab_models()
     own_embedding, own_head = draft.model.embed_tokens, draft.lm_head
+    original_gather = draft.logits_processor._gather_logits
 
     def load_draft(_target):
         proposer.draft_model = draft
@@ -205,6 +207,11 @@ def test_standalone_draft_keeps_own_embedding_and_head(monkeypatch):
     assert draft.lm_head is own_head
     assert draft.model.embed_tokens is not target.model.embed_tokens
     assert draft.lm_head is not target.lm_head
+    logits = torch.randn(2, 3)
+    if draft_tp == 1:
+        assert draft.logits_processor._gather_logits(logits) is logits
+    else:
+        assert draft.logits_processor._gather_logits is original_gather
 
 
 class TestDpLockstepSharded:

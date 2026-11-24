@@ -328,6 +328,8 @@ class Eagle3Proposer:
                 self._draft_tp_matches_target,
                 materialize_if_mismatched=False,
             )
+        elif self._draft_replicated:
+            self.draft_model.logits_processor._gather_logits = lambda logits: logits
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
             # checkout shouldn't break unrelated TPU runs at import time.

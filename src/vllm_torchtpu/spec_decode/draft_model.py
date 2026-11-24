@@ -57,18 +57,7 @@ class DraftModelProposer(Eagle3Proposer):
                 "draft-state rollback is not implemented."
             )
         self._sampling_chunk: DraftChunkInputs | None = None
-        self._sampling_step = 0
         self._draft_probs: dict[str, list[torch.Tensor]] = {}
-
-    def precompile(self) -> None:
-        self._sampling_chunk = None
-        super().precompile()
-
-    def load_model(self, target_model: torch.nn.Module) -> None:
-        super().load_model(target_model)
-        if self._draft_replicated:
-            assert self.draft_model is not None
-            self.draft_model.logits_processor._gather_logits = lambda logits: logits
 
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -80,13 +69,11 @@ class DraftModelProposer(Eagle3Proposer):
         if self.speculative_config.draft_sample_method == "greedy":
             return super()._draft_propose_token(hidden)
         logits = self._draft_logits(hidden)
-        chunk = self._sampling_chunk
+        chunk, self._sampling_chunk = self._sampling_chunk, None
         if chunk is None:
             return logits.argmax(dim=-1).to(torch.int32)
-        real_chunk = self.draft_chunks is not None and any(
-            chunk.start_index == c.start_index and chunk.attn_ctx is c.attn_ctx
-            for c in self.draft_chunks
-        )
+        # DP padding chunks carry no captured target hidden states.
+        real_chunk = chunk.hidden_states is not None
         if real_chunk:
             temperatures, top_k, top_p = self.runner._build_padded_sampling_params(
                 chunk.start_index, chunk.start_index + chunk.num_reqs, logits
@@ -110,17 +97,10 @@ class DraftModelProposer(Eagle3Proposer):
             tokens = self.runner._sync_one_replicated_draft(tokens)
             probs = self.runner._sync_one_replicated_draft(probs)
         if real_chunk:
-            self._draft_probs = {
-                rid: values
-                for rid, values in self._draft_probs.items()
-                if rid in self.runner.requests
-            }
             req_ids = self.runner.input_batch.req_ids[
                 chunk.start_index : chunk.start_index + chunk.num_reqs
             ]
             for row, req_id in enumerate(req_ids):
-                if self._sampling_step == 0:
-                    self._draft_probs[req_id] = []
                 self._draft_probs[req_id].append(probs[row])
         return tokens
 
@@ -161,6 +141,7 @@ class DraftModelProposer(Eagle3Proposer):
             return None
         k = self.speculative_config.num_speculative_tokens
         vocab = self.speculative_config.draft_model_config.get_vocab_size()
+        empty = torch.zeros((k, vocab), device=self.runner.device)
         rows = []
         for row, req_id in enumerate(req_ids):
             values = self._draft_probs.get(req_id)
@@ -168,11 +149,9 @@ class DraftModelProposer(Eagle3Proposer):
                 assert draft_lengths[row] == 0, (
                     f"Missing draft probabilities for {req_id}"
                 )
-                # Prefill rows have zero draft length and do not enter acceptance.
-                rows.append(torch.zeros((k, vocab), device=self.runner.device))
-            else:
-                rows.append(torch.stack(values, dim=0))
-        rows.append(torch.zeros_like(rows[0]))
+            # Prefill and sentinel rows do not enter acceptance.
+            rows.append(empty if values is None else torch.stack(values, dim=0))
+        rows.append(empty)
         return torch.stack(rows, dim=0)[
             segment_ids.long(), group_indices.long().clamp_max(k - 1)
         ]
@@ -254,6 +233,16 @@ class DraftModelProposer(Eagle3Proposer):
             device_seed,
         )
         assert chunk.hidden_states is not None
+        if self.speculative_config.draft_sample_method == "probabilistic":
+            self._draft_probs = {
+                rid: values
+                for rid, values in self._draft_probs.items()
+                if rid in self.runner.requests
+            }
+            for req_id in self.runner.input_batch.req_ids[
+                chunk.start_index : chunk.start_index + chunk.num_reqs
+            ]:
+                self._draft_probs[req_id] = []
         # Replay the unshifted target window into independent KV. Rejected
         # suffix entries remain unreachable through the seed's shortened seq_lens.
         super()._forward_draft(
@@ -295,8 +284,8 @@ class DraftModelProposer(Eagle3Proposer):
         loop_query_start_loc: torch.Tensor | None = None,
         loop_request_distribution: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        self._sampling_chunk = chunk
-        self._sampling_step = step_idx
+        if self.speculative_config.draft_sample_method == "probabilistic":
+            self._sampling_chunk = chunk
         return super()._forward_draft(
             chunk,
             input_ids,

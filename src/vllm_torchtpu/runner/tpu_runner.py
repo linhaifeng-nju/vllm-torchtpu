@@ -851,7 +851,6 @@ class TPUModelRunner(GPUModelRunner):
         with _torch_tpu_wrapper():
             super().__init__(parent_config, device)
         self.vllm_config = vllm_config
-        self.speculative_config = vllm_config.speculative_config
         self.pcp_manager = pcp_manager
         self.sequence_layout_planner = sequence_layout_planner
         _validate_libtpu_version()

@@ -121,16 +121,30 @@ def test_probabilistic_drafts_sample_the_declared_distribution():
 
 
 @pytest.mark.parametrize("rejected", [0, 1, 2])
+@pytest.mark.parametrize("method", ["greedy", "probabilistic"])
 def test_standalone_seed_follows_accepted_prefix_after_context_replay(
-    monkeypatch, rejected
+    monkeypatch, rejected, method
 ):
-    proposer = DraftModelProposer(SimpleNamespace(device="cpu"), _config())
+    runner = SimpleNamespace(
+        device="cpu",
+        input_batch=SimpleNamespace(req_ids=["active"]),
+        requests={"active": None, "waiting": None},
+    )
+    config = _config()
+    config.speculative_config.draft_sample_method = method
+    proposer = DraftModelProposer(runner, config)
+    previous = [torch.tensor([0.2, 0.3, 0.5])]
+    proposer._draft_probs = {rid: previous for rid in ("active", "waiting", "finished")}
     ids = torch.tensor([5, 6, 7, 8])
     positions = torch.tensor([10, 11, 12, 13])
     index = torch.tensor([3 - rejected])
     seeded = ids.index_put((index,), torch.tensor([99]))
     chunk = SimpleNamespace(
-        input_ids=ids, position_ids=positions, hidden_states=torch.ones(4, 2)
+        input_ids=ids,
+        position_ids=positions,
+        hidden_states=torch.ones(4, 2),
+        start_index=0,
+        num_reqs=1,
     )
     replayed = []
     monkeypatch.setattr(
@@ -153,6 +167,10 @@ def test_standalone_seed_follows_accepted_prefix_after_context_replay(
     assert seed.tolist() == [99]
     assert seed_pos.tolist() == [14 - rejected]
     assert indices.tolist() == [0]
+    if method == "probabilistic":
+        assert set(proposer._draft_probs) == {"active", "waiting"}
+        assert proposer._draft_probs["active"] == []
+        assert proposer._draft_probs["waiting"] is previous
 
 
 @pytest.mark.parametrize("uses_mrope", [False, True])
