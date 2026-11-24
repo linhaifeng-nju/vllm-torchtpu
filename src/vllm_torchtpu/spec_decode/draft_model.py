@@ -18,14 +18,22 @@ unshifted context tokens, and no target hidden-state input. Reuses the TPU
 proposer's attention metadata and bucketed loop instead of its CUDA/Triton base.
 """
 
+import dataclasses
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.sample.sampler import _SAMPLING_EPS
 
-from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
+from vllm_torchtpu.spec_decode.eagle3 import (
+    Eagle3Proposer,
+    _DpDummyDraft,
+    _static_shape_args,
+)
 from vllm_torchtpu.spec_decode.utils import DraftChunkInputs, fit_rows
 
 if TYPE_CHECKING:
@@ -38,29 +46,176 @@ class DraftModelProposer(Eagle3Proposer):
     def __init__(self, runner: "TPUModelRunner", vllm_config: VllmConfig) -> None:
         super().__init__(runner, vllm_config)
         self.speculative_config.verify_equal_vocab_size_if_draft_model()
-        if not self._draft_tp_matches_target:
+        if self.speculative_config.use_heterogeneous_vocab:
             raise NotImplementedError(
-                "Standalone TPU drafts require draft_tensor_parallel_size to "
-                "equal the target tensor_parallel_size."
+                "Standalone TPU drafts require matching token vocabularies; "
+                "use_heterogeneous_vocab is not implemented."
             )
-        if (
-            runner._pcp_enabled
-            or vllm_config.parallel_config.pipeline_parallel_size != 1
-            or vllm_config.parallel_config.data_parallel_size != 1
-            or vllm_config.parallel_config.decode_context_parallel_size != 1
-            or vllm_config.cache_config.enable_prefix_caching
-            or vllm_config.model_config.is_multimodal_model
-            or vllm_config.model_config.is_hybrid
-            or self.speculative_config.draft_model_config.is_hybrid
-            or self.speculative_config.draft_model_config.is_multimodal_model
-            or self.speculative_config.use_heterogeneous_vocab
-            or self.speculative_config.draft_sample_method != "greedy"
-        ):
+        if self.speculative_config.draft_model_config.is_hybrid:
             raise NotImplementedError(
-                "Standalone TPU drafts currently require dense text models, "
-                "DP/PP/DCP=1, no PCP, matching vocabularies, greedy proposals and "
-                "--no-enable-prefix-caching."
+                "Standalone TPU draft models require attention KV; recurrent "
+                "draft-state rollback is not implemented."
             )
+        self._sampling_chunk: DraftChunkInputs | None = None
+        self._sampling_step = 0
+        self._draft_probs: dict[str, list[torch.Tensor]] = {}
+
+    def precompile(self) -> None:
+        self._sampling_chunk = None
+        super().precompile()
+
+    def load_model(self, target_model: torch.nn.Module) -> None:
+        super().load_model(target_model)
+        if self._draft_replicated:
+            assert self.draft_model is not None
+            self.draft_model.logits_processor._gather_logits = lambda logits: logits
+
+    @_static_shape_args
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _draft_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        assert self.draft_model is not None
+        return self.draft_model.compute_logits(hidden)
+
+    def _draft_propose_token(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self.speculative_config.draft_sample_method == "greedy":
+            return super()._draft_propose_token(hidden)
+        logits = self._draft_logits(hidden)
+        chunk = self._sampling_chunk
+        if chunk is None:
+            return logits.argmax(dim=-1).to(torch.int32)
+        real_chunk = self.draft_chunks is not None and any(
+            chunk.start_index == c.start_index and chunk.attn_ctx is c.attn_ctx
+            for c in self.draft_chunks
+        )
+        if real_chunk:
+            temperatures, top_k, top_p = self.runner._build_padded_sampling_params(
+                chunk.start_index, chunk.start_index + chunk.num_reqs, logits
+            )
+        else:
+            temperatures = torch.ones((logits.shape[0], 1), device=logits.device)
+            top_k = torch.zeros_like(temperatures, dtype=torch.int32)
+            top_p = torch.ones_like(temperatures)
+        noise = torch.rand_like(
+            logits, dtype=torch.float32, generator=self.runner._get_sampling_generator()
+        )
+        tokens, probs = self._sample_probabilistic(
+            logits,
+            temperatures,
+            top_k,
+            top_p,
+            noise,
+            self.runner._sampler_applies_topk_topp(),
+        )
+        if self._draft_replicated:
+            tokens = self.runner._sync_one_replicated_draft(tokens)
+            probs = self.runner._sync_one_replicated_draft(probs)
+        if real_chunk:
+            self._draft_probs = {
+                rid: values
+                for rid, values in self._draft_probs.items()
+                if rid in self.runner.requests
+            }
+            req_ids = self.runner.input_batch.req_ids[
+                chunk.start_index : chunk.start_index + chunk.num_reqs
+            ]
+            for row, req_id in enumerate(req_ids):
+                if self._sampling_step == 0:
+                    self._draft_probs[req_id] = []
+                self._draft_probs[req_id].append(probs[row])
+        return tokens
+
+    @staticmethod
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _sample_probabilistic(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        noise: torch.Tensor,
+        apply_filter: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        greedy = temperatures <= _SAMPLING_EPS
+        scaled = logits.float() / temperatures.float().clamp_min(_SAMPLING_EPS)
+        if apply_filter:
+            scaled = apply_top_k_top_p(scaled, top_k, top_p)
+        probs = torch.softmax(scaled, dim=-1)
+        greedy_ids = logits.argmax(dim=-1)
+        probs = torch.where(
+            greedy, F.one_hot(greedy_ids, logits.shape[-1]).float(), probs
+        )
+        uniform = noise.clamp(
+            torch.finfo(noise.dtype).tiny, 1 - torch.finfo(noise.dtype).eps
+        )
+        sampled = (scaled - torch.log(-torch.log(uniform))).argmax(dim=-1)
+        tokens = torch.where(greedy.squeeze(1), greedy_ids, sampled)
+        return tokens.to(torch.int32), probs
+
+    def get_draft_probs(
+        self,
+        req_ids: list[str],
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        draft_lengths: np.ndarray,
+    ) -> torch.Tensor | None:
+        if self.speculative_config.draft_sample_method == "greedy":
+            return None
+        k = self.speculative_config.num_speculative_tokens
+        vocab = self.speculative_config.draft_model_config.get_vocab_size()
+        rows = []
+        for row, req_id in enumerate(req_ids):
+            values = self._draft_probs.get(req_id)
+            if values is None:
+                assert draft_lengths[row] == 0, (
+                    f"Missing draft probabilities for {req_id}"
+                )
+                # Prefill rows have zero draft length and do not enter acceptance.
+                rows.append(torch.zeros((k, vocab), device=self.runner.device))
+            else:
+                rows.append(torch.stack(values, dim=0))
+        rows.append(torch.zeros_like(rows[0]))
+        return torch.stack(rows, dim=0)[
+            segment_ids.long(), group_indices.long().clamp_max(k - 1)
+        ]
+
+    def _dp_lockstep_sharded(self) -> bool:
+        # Replicated probabilistic drafts pin both x and q across the target
+        # TP group. Idle DP ranks must also emit these collective programs.
+        return super()._dp_lockstep_sharded() or (
+            self.speculative_config.draft_sample_method == "probabilistic"
+            and self.vllm_config.parallel_config.tensor_parallel_size > 1
+            and self.runner._dp_lockstep_enabled()
+        )
+
+    def _dp_dummy_draft_step(self, dummy: _DpDummyDraft, step: int) -> torch.Tensor:
+        if dummy.positions.ndim == 2:
+            dummy = dataclasses.replace(
+                dummy,
+                positions=dummy.positions[0],
+                loop_positions=dummy.loop_positions[0],
+            )
+        if step == 0:
+            super()._forward_draft(
+                dummy.chunk,
+                dummy.input_ids,
+                dummy.positions,
+                dummy.target_hidden_states,
+                0,
+                0,
+                None,
+                dummy.bucket,
+            )
+            dummy = dataclasses.replace(
+                dummy,
+                chunk=dataclasses.replace(
+                    dummy.chunk,
+                    num_reqs=min(dummy.chunk.num_reqs, dummy.loop_bucket),
+                ),
+                input_ids=dummy.loop_input_ids,
+                positions=dummy.loop_positions,
+                target_hidden_states=dummy.loop_hidden,
+                bucket=dummy.loop_bucket,
+            )
+        return super()._dp_dummy_draft_step(dummy, step)
 
     def _prepare_draft_inputs(
         self,
@@ -72,6 +227,23 @@ class DraftModelProposer(Eagle3Proposer):
         next_tokens_device: torch.Tensor | None = None,
         device_seed: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray | torch.Tensor]:
+        if chunk.position_ids.ndim == 2:
+            # An independent text draft uses absolute positions even when the
+            # target uses multimodal RoPE axes.
+            qsl = chunk.query_start_loc_np[: chunk.num_reqs + 1]
+            counts = np.diff(qsl)
+            owners = np.repeat(np.arange(chunk.num_reqs), counts)
+            owners = np.pad(owners, (0, chunk.input_ids.shape[0] - len(owners)))
+            owners_dev = torch.from_numpy(owners).to(self.runner.device)
+            starts = torch.from_numpy(qsl[:-1][owners]).to(self.runner.device)
+            lengths = torch.from_numpy(counts[owners]).to(self.runner.device)
+            offsets = torch.arange(chunk.input_ids.shape[0], device=self.runner.device)
+            chunk = dataclasses.replace(
+                chunk,
+                position_ids=(
+                    chunk.attn_ctx.seq_lens[owners_dev] - lengths + offsets - starts
+                ),
+            )
         seeded_ids, positions, indices, rejected = super()._prepare_draft_inputs(
             chunk,
             sampled_token_ids,
@@ -123,6 +295,8 @@ class DraftModelProposer(Eagle3Proposer):
         loop_query_start_loc: torch.Tensor | None = None,
         loop_request_distribution: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._sampling_chunk = chunk
+        self._sampling_step = step_idx
         return super()._forward_draft(
             chunk,
             input_ids,

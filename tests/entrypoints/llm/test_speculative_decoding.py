@@ -490,6 +490,11 @@ def _test_correctness_helper(
         # 2. Speculative Run
         with _engine(model_name, speculative_config, kwargs) as spec_engine:
             spec_texts = spec_engine.generate(test_prompts, sampling_config)
+            if speculative_config["method"] == "draft_model":
+                # Reuse completed requests' cached prefix in a subsequent batch.
+                cached_texts = spec_engine.generate(test_prompts, sampling_config)
+                _assert_no_spec_divergence(test_prompts, ref_texts, cached_texts)
+                assert spec_engine.num_drafts() > 0
 
         _assert_no_spec_divergence(test_prompts, ref_texts, spec_texts)
 
@@ -498,24 +503,75 @@ def _test_correctness_helper(
 @pytest.mark.nightly
 @pytest.mark.multichip
 @pytest.mark.parametrize("num_speculative_tokens", [1, 3])
+@pytest.mark.parametrize("async_scheduling", [False, True])
 def test_standalone_draft_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
     num_speculative_tokens: int,
+    async_scheduling: bool,
 ):
-    """Different-size causal models preserve the target's greedy output."""
+    """Independent causal draft weights preserve the target's greedy output."""
     _test_correctness_helper(
         monkeypatch,
         sampling_config,
-        "Qwen/Qwen3-32B",
+        "Qwen/Qwen3-0.6B",
         {
             "method": "draft_model",
             "model": "Qwen/Qwen3-0.6B",
             "num_speculative_tokens": num_speculative_tokens,
         },
-        async_scheduling=False,
-        extra_kwargs={"enable_prefix_caching": False},
+        async_scheduling=async_scheduling,
+        extra_kwargs={"enable_prefix_caching": True},
     )
+
+
+@pytest.mark.nightly
+@pytest.mark.multichip
+@pytest.mark.timeout(2400)
+@pytest.mark.parametrize("draft_tp", [1, None])
+def test_standalone_probabilistic_mixed_sampling(draft_tp):
+    """Retained proposal probabilities survive mixed sampling and cached requests."""
+    model = "Qwen/Qwen3-0.6B"
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "integer", "enum": [8]}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    prompts = ["Compute 3+5. Return the answer as JSON. /no_think"] * 4
+    params = [
+        SamplingParams(
+            temperature=temperature,
+            top_k=20,
+            top_p=0.9,
+            max_tokens=128,
+            structured_outputs=StructuredOutputsParams(json=schema),
+        )
+        for temperature in (0.0, 0.7, 0.0, 0.7)
+    ]
+    with _engine(
+        model,
+        {
+            "method": "draft_model",
+            "model": model,
+            "num_speculative_tokens": 3,
+            "draft_tensor_parallel_size": draft_tp,
+            "draft_sample_method": "probabilistic",
+        },
+        dict(
+            tensor_parallel_size=_get_tensor_parallel_size(),
+            max_model_len=256,
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+            max_num_seqs=4,
+            enable_prefix_caching=True,
+            async_scheduling=True,
+        ),
+    ) as engine:
+        for _ in range(2):
+            outputs = engine.generate_outputs(prompts, params)
+            assert all(json.loads(o.outputs[0].text)["answer"] == 8 for o in outputs)
+        drafted, accepted, _ = engine.spec_counters()
+        assert drafted > 0 and accepted > 0
 
 
 @pytest.mark.timeout(1800)

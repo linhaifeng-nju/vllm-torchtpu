@@ -831,8 +831,27 @@ class TPUModelRunner(GPUModelRunner):
             normalize_draft_config(
                 vllm_config.speculative_config.draft_model_config.hf_config
             )
+        parent_config = vllm_config
+        spec = vllm_config.speculative_config
+        if (
+            spec is not None
+            and spec.uses_draft_model()
+            and spec.draft_tensor_parallel_size == 1
+            and vllm_config.parallel_config.tensor_parallel_size > 1
+        ):
+            # Parent init constructs a CUDA drafter that we discard below. Its
+            # CUDA compile-cache guard rejects replicated drafts. Keep its
+            # temporary allocation config TP-matched; TPU loading uses the
+            # original config and its separate draft compilation prefix.
+            parent_config = copy.copy(vllm_config)
+            parent_config.speculative_config = copy.copy(spec)
+            parent_config.speculative_config.draft_parallel_config = (
+                spec.target_parallel_config
+            )
         with _torch_tpu_wrapper():
-            super().__init__(vllm_config, device)
+            super().__init__(parent_config, device)
+        self.vllm_config = vllm_config
+        self.speculative_config = vllm_config.speculative_config
         self.pcp_manager = pcp_manager
         self.sequence_layout_planner = sequence_layout_planner
         _validate_libtpu_version()
@@ -5622,6 +5641,16 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates=topk_candidates,
             target_argmax=target_argmax,
             apply_topk_topp=apply_topk_topp,
+            draft_probs=(
+                self.drafter.get_draft_probs(
+                    self.input_batch.req_ids[cur_start_idx:cur_end_idx],
+                    md.segment_ids,
+                    md.group_indices,
+                    md.draft_lengths_cpu,
+                )
+                if do_sampling and isinstance(self.drafter, DraftModelProposer)
+                else None
+            ),
         )
         for proc in processors:
             proc.finish(next_tokens)

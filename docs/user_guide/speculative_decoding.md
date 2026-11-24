@@ -147,8 +147,8 @@ states. The target verifies the proposals through the existing rejection sampler
 vllm serve Qwen/Qwen3-32B \
   --tensor-parallel-size 8 \
   --max-model-len 8192 \
-  --no-async-scheduling \
-  --no-enable-prefix-caching \
+  --async-scheduling \
+  --enable-prefix-caching \
   --speculative-config '{
     "method": "draft_model",
     "model": "Qwen/Qwen3-0.6B",
@@ -156,11 +156,25 @@ vllm serve Qwen/Qwen3-32B \
   }'
 ```
 
-The initial TPU implementation requires matching target and draft vocabularies,
-matching tensor parallel sizes, full-attention text models, and DP/PP/DCP=1.
-Prefix caching, PCP, asynchronous scheduling, and heterogeneous vocabularies are
-not supported. The draft currently uses greedy proposals; set
-`draft_sample_method="greedy"` (the default).
+Standalone drafts use the existing TPU model-based speculative scheduling path,
+including asynchronous scheduling, prefix caching and EP-coupled data parallelism.
+The existing TPU DP collective scheduling constraints also apply to standalone
+drafts. The draft can use the target's tensor parallel size or run replicated with
+`draft_tensor_parallel_size=1`. The public PCP/PP speculative-decoding constraints
+still apply. The draft checkpoint must use attention KV and the same token
+vocabulary as the target; recurrent draft models and heterogeneous vocabularies
+are not implemented.
+
+`draft_sample_method="greedy"` (the default) proposes argmax tokens and supports
+both greedy and non-greedy target sampling. Set
+`draft_sample_method="probabilistic"` to sample proposals using each request's
+temperature, top-k and top-p. The proposer retains the actual draft distribution
+for the rejection sampler's probability-ratio test and residual sampling. These
+probabilities consume additional memory proportional to batch size, draft length
+and vocabulary size.
+
+As with other TPU sampling paths, non-greedy requests cannot specify a per-request
+`seed`. The server-level `--seed` initializes the shared sampling generator.
 
 This implementation replays the target's current input window into the draft KV
 before drafting from the target's newly sampled token. It establishes correctness;
