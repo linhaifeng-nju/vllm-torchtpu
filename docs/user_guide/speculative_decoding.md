@@ -139,9 +139,8 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
 
 ## 5. Standalone Draft Model
 
-An independent causal model proposes tokens from its own KV cache. It loads its
-own embedding and output head and consumes token IDs rather than target hidden
-states. The target verifies the proposals through the existing rejection sampler.
+Use a smaller causal model with independent weights and KV cache to propose
+tokens for the target to verify.
 
 ```bash
 vllm serve Qwen/Qwen3-32B \
@@ -156,26 +155,15 @@ vllm serve Qwen/Qwen3-32B \
   }'
 ```
 
-Standalone drafts use the existing TPU model-based speculative scheduling path,
-including asynchronous scheduling, prefix caching and EP-coupled data parallelism.
-The existing TPU DP collective scheduling constraints also apply to standalone
-drafts. The draft can use the target's tensor parallel size or run replicated with
-`draft_tensor_parallel_size=1`. The public PCP/PP speculative-decoding constraints
-still apply. The draft checkpoint must use attention KV and the same token
-vocabulary as the target; recurrent draft models and heterogeneous vocabularies
-are not implemented.
+Supports async scheduling, prefix caching and EP-coupled DP under existing TPU
+parallelism constraints. Draft TP can match the target or use
+`draft_tensor_parallel_size=1`. The draft must use attention KV and share the
+target's token vocabulary.
 
-`draft_sample_method="greedy"` (the default) proposes argmax tokens and supports
-both greedy and non-greedy target sampling. Set
-`draft_sample_method="probabilistic"` to sample proposals using each request's
-temperature, top-k and top-p. The proposer retains the actual draft distribution
-for the rejection sampler's probability-ratio test and residual sampling. These
-probabilities consume additional memory proportional to batch size, draft length
-and vocabulary size.
+`draft_sample_method="greedy"` (default) supports greedy and non-greedy targets.
+Use `"probabilistic"` for proposals sampled with request temperature/top-k/top-p;
+retaining draft probabilities uses additional memory. Non-greedy requests support
+the server-level `--seed` only.
 
-As with other TPU sampling paths, non-greedy requests cannot specify a per-request
-`seed`. The server-level `--seed` initializes the shared sampling generator.
-
-This implementation replays the target's current input window into the draft KV
-before drafting from the target's newly sampled token. It establishes correctness;
-its additional context forward can limit speedups, especially during prefill.
+Replaying the target's input window into the draft KV adds a forward pass, which
+can limit speedups, especially during prefill.
