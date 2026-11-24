@@ -1107,16 +1107,21 @@ def test_rejection_sampler_random_draft_probs_ratio_and_residual(device):
     assert torch.equal(output, expected)
 
 
-def test_rejection_sampler_random_draft_probs_residual_subtracts_q(device):
+@pytest.mark.parametrize("draft_token, has_q", [(0, True), (-1, True), (-1, False)])
+def test_rejection_sampler_random_draft_probs_residual_subtracts_q(
+    device, draft_token, has_q
+):
     """A residual where the one-hot and the p - q recoveries differ."""
     sampler = RejectionSampler()
-    draft_token_ids = torch.tensor([0], dtype=torch.int32, device=device)
+    draft_token_ids = torch.tensor([draft_token], dtype=torch.int32, device=device)
     num_draft_tokens = torch.tensor([1], dtype=torch.int32, device=device)
-    # p = [.1, .6, .3]; q = [.3, .6, .1]. Draft 0: ratio 1/3, u = 0.5 rejects.
-    # One-hot recovery (p without 0) peaks at token 1; p - q = [0, 0, .2]
-    # peaks at token 2.
-    target_logits = torch.log(torch.tensor([[0.1, 0.6, 0.3]], device=device))
+    # Grammar bans token 0: p = [0, .6, .4]; q = [.3, .6, .1]. Whether
+    # token 0 is preserved or invalidated to -1, recovery needs p - q,
+    # peaking at token 2. A one-hot draft instead recovers token 1.
+    target_logits = torch.log(torch.tensor([[0.0, 0.6, 0.4]], device=device))
     draft_probs = torch.tensor([[0.3, 0.6, 0.1]], dtype=torch.float32, device=device)
+    if not has_q:
+        draft_probs.zero_()  # An unsampled placeholder must recover p directly.
     common = dict(
         draft_token_ids=draft_token_ids,
         num_draft_tokens=num_draft_tokens,
@@ -1133,7 +1138,7 @@ def test_rejection_sampler_random_draft_probs_residual_subtracts_q(device):
         do_sampling=True,
     )
     with_q = sampler(**common, draft_probs=draft_probs)
-    assert with_q.tolist() == [[2, -1]]
+    assert with_q.tolist() == [[2 if has_q else 1, -1]]
     one_hot = sampler(**common)
     assert one_hot.tolist() == [[1, -1]]
 

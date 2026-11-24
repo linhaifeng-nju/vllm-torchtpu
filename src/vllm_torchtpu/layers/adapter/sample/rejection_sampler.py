@@ -146,6 +146,8 @@ class RejectionSampler:
             from (probabilistic drafting), shaped like target_logits. None
             treats the draft as one-hot (greedy drafting). Used by the
             non-greedy path; the greedy and synthetic decisions ignore it.
+            Unsampled placeholders must have zero rows. Grammar-invalidated
+            proposals retain their original distribution for residual sampling.
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the
@@ -548,14 +550,11 @@ def _random_rejection_sample_with_segment(
         )
     accepted = accepted & valid_draft_token_ids
 
-    # On rejection, resample from the residual max(0, p - q). Placeholder
-    # drafts have no q mass to subtract, so their recovery distribution
-    # remains the full target distribution.
+    # A grammar-invalidated proposal still came from q and needs p - q.
+    # Unsampled placeholders carry zero q, recovering the full target p.
     if draft_probs is not None:
-        recovered_dist = torch.where(
-            valid_draft_token_ids.unsqueeze(-1),
-            torch.clamp(target_probs - draft_probs.to(target_probs.dtype), min=0.0),
-            target_probs,
+        recovered_dist = torch.clamp(
+            target_probs - draft_probs.to(target_probs.dtype), min=0.0
         )
     else:
         # With q a delta at x, subtracting q only touches entry x, so the
