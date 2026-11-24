@@ -42,7 +42,10 @@ def _make_proposer(
     draft_tp: int | None = 1, target_tp: int = 1, method: str = "eagle3"
 ) -> Eagle3Proposer:
     speculative_config = SimpleNamespace(
-        draft_tensor_parallel_size=draft_tp, method=method, draft_model_config=None
+        draft_tensor_parallel_size=draft_tp,
+        method=method,
+        draft_model_config=None,
+        uses_draft_model=lambda: method == "draft_model",
     )
     parallel_config = SimpleNamespace(
         tensor_parallel_size=target_tp, pipeline_parallel_size=1

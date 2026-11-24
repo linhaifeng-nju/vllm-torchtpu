@@ -196,11 +196,9 @@ class Eagle3Proposer:
     This class is responsible for loading the draft model and generating draft
     tokens based on the target model's outputs.
 
-    Current limitations:
-    - Greedy decoding only (temperature=0). The draft emits argmax tokens, not
-      a probability distribution, so the rejection sampler cannot perform
-      proper non-greedy rejection sampling. Non-greedy requests are rejected
-      at add_request time in tpu_platform.py before reaching this proposer.
+    - This proposer emits greedy draft tokens. Non-greedy target verification
+      treats their proposal distribution as one-hot; standalone drafts can
+      override proposal sampling and provide their actual distribution.
     - draft_tensor_parallel_size selects the draft's parallelism: 1 runs the
       eagle3/mtp head fully replicated on every TPU worker; target tp runs it
       sharded across the TP group.
@@ -319,7 +317,7 @@ class Eagle3Proposer:
         self._validate_dsa_draft(all_attn_layers, draft_attn_layer_names)
 
         assert self.draft_model is not None
-        if self.speculative_config.method != "draft_model":
+        if not self.speculative_config.uses_draft_model():
             maybe_share_embeddings(
                 self.draft_model, target_model, self._draft_tp_matches_target
             )
@@ -872,7 +870,7 @@ class Eagle3Proposer:
         self.draft_vllm_config = copy.copy(self.vllm_config)
         draft_model_config = copy.copy(self.speculative_config.draft_model_config)
         draft_model_config.runner_type = "draft"
-        if self.speculative_config.method == "draft_model":
+        if self.speculative_config.uses_draft_model():
             self.draft_vllm_config.model_config = draft_model_config
             self.draft_vllm_config.quant_config = None
         draft_compilation_config = copy.copy(self.vllm_config.compilation_config)
@@ -899,7 +897,7 @@ class Eagle3Proposer:
                 self.draft_model = self._load_mtp_draft_sharing_head(
                     model_loader, draft_model_config, target_model
                 )
-            elif self.speculative_config.method == "draft_model":
+            elif self.speculative_config.uses_draft_model():
                 self.draft_model = get_model(
                     vllm_config=self.draft_vllm_config, prefix="draft_model"
                 )
@@ -2128,7 +2126,7 @@ class Eagle3Proposer:
             "input_ids": input_ids,
             "positions": positions,
         }
-        if self.speculative_config.method != "draft_model":
+        if not self.speculative_config.uses_draft_model():
             kwargs["hidden_states"] = target_hidden_states
         if self.speculative_config.method == "mtp":
             kwargs["spec_step_idx"] = step_idx
@@ -2206,7 +2204,7 @@ class Eagle3Proposer:
         """
         if (
             self.speculative_config.method == "mtp"
-            or self.speculative_config.method == "draft_model"
+            or self.speculative_config.uses_draft_model()
         ):
             return False
         assert self.draft_model is not None
