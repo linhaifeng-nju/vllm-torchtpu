@@ -3946,6 +3946,18 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
             _assert_same_logprobs_lists(deferred.logprobs, synchronous.logprobs)
 
 
+@pytest.mark.parametrize("method", ["greedy", "probabilistic"])
+def test_standalone_async_drafts_are_not_synchronized_twice(method):
+    drafter = object.__new__(tpu_runner.DraftModelProposer)
+    drafter.speculative_config = SimpleNamespace(draft_sample_method=method)
+    drafts = torch.tensor([[1, 2, 3]], dtype=torch.int32)
+    pin = MagicMock(side_effect=lambda tokens: tokens)
+    runner = SimpleNamespace(drafter=drafter, _sync_one_replicated_draft=pin)
+
+    assert TPUModelRunner._sync_replicated_drafts_across_tp(runner, drafts) is drafts
+    assert pin.call_count == (1 if method == "greedy" else 0)
+
+
 @pytest.mark.parametrize("probabilistic_draft", [False, True])
 def test_runner_sampling_paths_draw_float32_uniform_noise(
     monkeypatch, probabilistic_draft

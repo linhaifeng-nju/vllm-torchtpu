@@ -3120,6 +3120,13 @@ class TPUModelRunner(GPUModelRunner):
         """
         if drafts is None:
             return None
+        if (
+            isinstance(self.drafter, DraftModelProposer)
+            and self.drafter.speculative_config.draft_sample_method == "probabilistic"
+        ):
+            # Each step already pins both the proposal and its distribution,
+            # including the steps replayed by idle DP ranks.
+            return drafts
         if isinstance(drafts, list):
             return [self._sync_one_replicated_draft(d) for d in drafts]
         if not isinstance(drafts, torch.Tensor):

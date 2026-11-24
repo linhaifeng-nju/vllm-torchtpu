@@ -155,8 +155,8 @@ vllm serve Qwen/Qwen3-32B \
   }'
 ```
 
-Supports async scheduling, prefix caching and EP-coupled DP under existing TPU
-parallelism constraints. Draft TP can match the target or use
+Supports async scheduling and prefix caching under existing TPU parallelism
+constraints; EP-coupled DP remains unverified. Draft TP can match the target or use
 `draft_tensor_parallel_size=1`. The draft must use attention KV and share the
 target's token vocabulary.
 
