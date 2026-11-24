@@ -1864,6 +1864,9 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch, method)
         inductor_compile_config={}
     )
     proposer.speculative_config.draft_model_config = SimpleNamespace(runner_type=None)
+    draft_quant_config = object()
+    resolve_quantization = mock.Mock(return_value=draft_quant_config)
+    monkeypatch.setattr(e3.VllmConfig, "get_quantization_config", resolve_quantization)
     loaded = {}
 
     class _Loader:
@@ -1905,6 +1908,12 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch, method)
     assert loaded["prefix"] == ("draft_model" if method == "draft_model" else "")
     if method == "draft_model":
         assert proposer.draft_vllm_config.model_config is loaded["model_config"]
+        assert proposer.draft_vllm_config.quant_config is draft_quant_config
+        resolve_quantization.assert_called_once_with(
+            loaded["model_config"], proposer.vllm_config.load_config
+        )
+    else:
+        resolve_quantization.assert_not_called()
 
 
 @pytest.mark.tpu_test

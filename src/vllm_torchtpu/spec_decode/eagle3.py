@@ -874,7 +874,10 @@ class Eagle3Proposer:
         draft_model_config.runner_type = "draft"
         if self.speculative_config.uses_draft_model():
             self.draft_vllm_config.model_config = draft_model_config
-            self.draft_vllm_config.quant_config = None
+            # A shallow copy does not rerun VllmConfig's quantization setup.
+            self.draft_vllm_config.quant_config = VllmConfig.get_quantization_config(
+                draft_model_config, self.draft_vllm_config.load_config
+            )
         draft_compilation_config = copy.copy(self.vllm_config.compilation_config)
         draft_compilation_config.inductor_compile_config = copy.copy(
             self.vllm_config.compilation_config.inductor_compile_config
