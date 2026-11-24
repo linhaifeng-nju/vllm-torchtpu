@@ -184,6 +184,26 @@ def test_draft_tp_invalid_raises(draft_tp):
         _make_proposer(draft_tp=draft_tp, target_tp=8)
 
 
+def test_standalone_draft_keeps_own_embedding_and_head(monkeypatch):
+    proposer = _make_proposer(method="draft_model")
+    draft, target = _make_vocab_models()
+    own_embedding, own_head = draft.model.embed_tokens, draft.lm_head
+
+    def load_draft(_target):
+        proposer.draft_model = draft
+
+    monkeypatch.setattr(proposer, "_load_draft_model", load_draft)
+    monkeypatch.setattr(
+        "vllm_torchtpu.spec_decode.eagle3.get_layers_from_vllm_config",
+        lambda *_args: {},
+    )
+    proposer.load_model(target)
+    assert draft.model.embed_tokens is own_embedding
+    assert draft.lm_head is own_head
+    assert draft.model.embed_tokens is not target.model.embed_tokens
+    assert draft.lm_head is not target.lm_head
+
+
 class TestDpLockstepSharded:
     """Which drafts must have their collective trace replayed by idle DP ranks.
 
@@ -1820,13 +1840,14 @@ def test_build_draft_attn_metadata_loop_cache_follows_seq_lens_delta(device, kv_
     assert len(rebuilds) == 1
 
 
-def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
+@pytest.mark.parametrize("method", ["mtp", "draft_model"])
+def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch, method):
     """The exact copied config used to construct the draft must also be the
     TPU wrapper config; recovering it from an optional model attribute is not
     an equivalent contract."""
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
-    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer = _make_proposer(draft_tp=1, method=method)
     proposer.runner = SimpleNamespace(mesh=object())
     proposer.vllm_config.load_config = object()
     proposer.vllm_config.compilation_config = SimpleNamespace(
@@ -1836,9 +1857,10 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
     loaded = {}
 
     class _Loader:
-        def load_model(self, *, vllm_config, model_config):
+        def load_model(self, *, vllm_config, model_config, prefix=""):
             loaded["vllm_config"] = vllm_config
             loaded["model_config"] = model_config
+            loaded["prefix"] = prefix
             return object()
 
     wrapper_configs = []
@@ -1850,6 +1872,15 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
         yield
 
     monkeypatch.setattr(e3, "get_model_loader", lambda _cfg: _Loader())
+    monkeypatch.setattr(
+        e3,
+        "get_model",
+        lambda *, vllm_config, prefix: _Loader().load_model(
+            vllm_config=vllm_config,
+            model_config=vllm_config.model_config,
+            prefix=prefix,
+        ),
+    )
     monkeypatch.setattr(e3, "set_model_tag", lambda _tag: contextlib.nullcontext())
     monkeypatch.setattr(
         e3, "set_current_vllm_config", lambda _cfg: contextlib.nullcontext()
@@ -1861,6 +1892,9 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
 
     assert proposer.draft_vllm_config is loaded["vllm_config"]
     assert wrapper_configs == [proposer.draft_vllm_config]
+    assert loaded["prefix"] == ("draft_model" if method == "draft_model" else "")
+    if method == "draft_model":
+        assert proposer.draft_vllm_config.model_config is loaded["model_config"]
 
 
 @pytest.mark.tpu_test

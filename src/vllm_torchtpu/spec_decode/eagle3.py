@@ -26,7 +26,7 @@ from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader import get_model, get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
@@ -319,16 +319,17 @@ class Eagle3Proposer:
         self._validate_dsa_draft(all_attn_layers, draft_attn_layer_names)
 
         assert self.draft_model is not None
-        maybe_share_embeddings(
-            self.draft_model, target_model, self._draft_tp_matches_target
-        )
-        maybe_share_lm_head(
-            self.draft_model,
-            target_model,
-            self._draft_replicated,
-            self._draft_tp_matches_target,
-            materialize_if_mismatched=False,
-        )
+        if self.speculative_config.method != "draft_model":
+            maybe_share_embeddings(
+                self.draft_model, target_model, self._draft_tp_matches_target
+            )
+            maybe_share_lm_head(
+                self.draft_model,
+                target_model,
+                self._draft_replicated,
+                self._draft_tp_matches_target,
+                materialize_if_mismatched=False,
+            )
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
             # checkout shouldn't break unrelated TPU runs at import time.
@@ -871,6 +872,9 @@ class Eagle3Proposer:
         self.draft_vllm_config = copy.copy(self.vllm_config)
         draft_model_config = copy.copy(self.speculative_config.draft_model_config)
         draft_model_config.runner_type = "draft"
+        if self.speculative_config.method == "draft_model":
+            self.draft_vllm_config.model_config = draft_model_config
+            self.draft_vllm_config.quant_config = None
         draft_compilation_config = copy.copy(self.vllm_config.compilation_config)
         draft_compilation_config.inductor_compile_config = copy.copy(
             self.vllm_config.compilation_config.inductor_compile_config
@@ -894,6 +898,10 @@ class Eagle3Proposer:
             ):
                 self.draft_model = self._load_mtp_draft_sharing_head(
                     model_loader, draft_model_config, target_model
+                )
+            elif self.speculative_config.method == "draft_model":
+                self.draft_model = get_model(
+                    vllm_config=self.draft_vllm_config, prefix="draft_model"
                 )
             else:
                 self.draft_model = model_loader.load_model(
@@ -1314,6 +1322,9 @@ class Eagle3Proposer:
                 seq_lens_delta=0,
                 num_rejected_np=rejected_np_per_chunk[ci],
                 num_tokens_padded=input_ids.shape[0],
+                num_rejected_dev=(
+                    num_rejected if isinstance(num_rejected, torch.Tensor) else None
+                ),
             )
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
@@ -2116,8 +2127,9 @@ class Eagle3Proposer:
         kwargs: dict[str, torch.Tensor | int] = {
             "input_ids": input_ids,
             "positions": positions,
-            "hidden_states": target_hidden_states,
         }
+        if self.speculative_config.method != "draft_model":
+            kwargs["hidden_states"] = target_hidden_states
         if self.speculative_config.method == "mtp":
             kwargs["spec_step_idx"] = step_idx
 
@@ -2192,7 +2204,10 @@ class Eagle3Proposer:
         """Whether this draft checkpoint feeds combine_hidden_states the
         concatenation of several target aux hidden-state layers.
         """
-        if self.speculative_config.method == "mtp":
+        if (
+            self.speculative_config.method == "mtp"
+            or self.speculative_config.method == "draft_model"
+        ):
             return False
         assert self.draft_model is not None
         return bool(getattr(self.draft_model.model, "use_aux_hidden_state", True))

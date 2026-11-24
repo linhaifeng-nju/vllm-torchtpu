@@ -154,7 +154,7 @@ def get_test_prompts(speculative_config: dict):
     method = speculative_config["method"]
     if method == "ngram":
         return get_ngram_test_prompts()
-    if method == "eagle3":
+    if method in ("eagle3", "draft_model"):
         return get_eagle3_test_prompts()
     if method == "dflash":
         return get_dflash_test_prompts()
@@ -492,6 +492,30 @@ def _test_correctness_helper(
             spec_texts = spec_engine.generate(test_prompts, sampling_config)
 
         _assert_no_spec_divergence(test_prompts, ref_texts, spec_texts)
+
+
+@pytest.mark.timeout(1800)
+@pytest.mark.nightly
+@pytest.mark.multichip
+@pytest.mark.parametrize("num_speculative_tokens", [1, 3])
+def test_standalone_draft_correctness_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    num_speculative_tokens: int,
+):
+    """Different-size causal models preserve the target's greedy output."""
+    _test_correctness_helper(
+        monkeypatch,
+        sampling_config,
+        "Qwen/Qwen3-32B",
+        {
+            "method": "draft_model",
+            "model": "Qwen/Qwen3-0.6B",
+            "num_speculative_tokens": num_speculative_tokens,
+        },
+        async_scheduling=False,
+        extra_kwargs={"enable_prefix_caching": False},
+    )
 
 
 @pytest.mark.timeout(1800)

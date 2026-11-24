@@ -214,6 +214,7 @@ from vllm_torchtpu.spec_decode.adaptive_verification import (
     StepCostTable,
 )
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+from vllm_torchtpu.spec_decode.draft_model import DraftModelProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.utils import (
@@ -744,7 +745,7 @@ class TPUModelRunner(GPUModelRunner):
 
     @property
     def _is_async_drafter(self) -> bool:
-        """Whether this worker runs a hidden-state drafter.
+        """Whether this worker runs a model-based drafter.
 
         Under a pipeline only the last stage samples, so only it hosts the
         draft; the other stages hand their hidden states on and never draft.
@@ -754,6 +755,7 @@ class TPUModelRunner(GPUModelRunner):
         return (
             self.speculative_config.use_eagle()
             or self.speculative_config.method == "dflash"
+            or self.speculative_config.uses_draft_model()
         )
 
     @property
@@ -1514,6 +1516,8 @@ class TPUModelRunner(GPUModelRunner):
             )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.uses_draft_model():
+                self.drafter = DraftModelProposer(self, self.vllm_config)
             elif self.speculative_config.method == "dflash":
                 self.drafter = DFlashProposer(self, self.vllm_config)
             elif self.speculative_config.method == "dspark":
