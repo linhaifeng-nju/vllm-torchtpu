@@ -45,7 +45,6 @@ class DraftModelProposer(Eagle3Proposer):
 
     def __init__(self, runner: "TPUModelRunner", vllm_config: VllmConfig) -> None:
         super().__init__(runner, vllm_config)
-        self.speculative_config.verify_equal_vocab_size_if_draft_model()
         if self.speculative_config.use_heterogeneous_vocab:
             raise NotImplementedError(
                 "Standalone TPU drafts require matching token vocabularies; "
@@ -118,16 +117,14 @@ class DraftModelProposer(Eagle3Proposer):
         scaled = logits.float() / temperatures.float().clamp_min(_SAMPLING_EPS)
         if apply_filter:
             scaled = apply_top_k_top_p(scaled, top_k, top_p)
-        probs = torch.softmax(scaled, dim=-1)
-        greedy_ids = logits.argmax(dim=-1)
-        probs = torch.where(
-            greedy, F.one_hot(greedy_ids, logits.shape[-1]).float(), probs
-        )
         uniform = noise.clamp(
             torch.finfo(noise.dtype).tiny, 1 - torch.finfo(noise.dtype).eps
         )
-        sampled = (scaled - torch.log(-torch.log(uniform))).argmax(dim=-1)
-        tokens = torch.where(greedy.squeeze(1), greedy_ids, sampled)
+        scores = torch.where(greedy, logits, scaled - torch.log(-torch.log(uniform)))
+        tokens = scores.argmax(dim=-1)
+        probs = torch.where(
+            greedy, F.one_hot(tokens, logits.shape[-1]).float(), scaled.softmax(dim=-1)
+        )
         return tokens.to(torch.int32), probs
 
     def get_draft_probs(

@@ -155,15 +155,9 @@ vllm serve Qwen/Qwen3-32B \
   }'
 ```
 
-Supports async scheduling and prefix caching under existing TPU parallelism
-constraints; EP-coupled DP remains unverified. Draft TP can match the target or use
-`draft_tensor_parallel_size=1`. The draft must use attention KV and share the
-target's token vocabulary.
+The draft needs attention KV and a matching token vocabulary. Draft TP defaults
+to target TP and can be set to 1. EP-coupled DP remains unverified.
 
-`draft_sample_method="greedy"` (default) supports greedy and non-greedy targets.
-Use `"probabilistic"` for proposals sampled with request temperature/top-k/top-p;
-retaining draft probabilities uses additional memory. Non-greedy requests support
-the server-level `--seed` only.
-
-Replaying the target's input window into the draft KV adds a forward pass, which
-can limit speedups, especially during prefill.
+Set `draft_sample_method="probabilistic"` to sample proposals with request
+temperature, top-k, and top-p. This retains draft probabilities in memory.
+Non-greedy requests support the server-level `--seed` only.

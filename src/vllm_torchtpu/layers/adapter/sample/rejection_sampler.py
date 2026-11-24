@@ -551,7 +551,6 @@ def _random_rejection_sample_with_segment(
     accepted = accepted & valid_draft_token_ids
 
     # A grammar-invalidated proposal still came from q and needs p - q.
-    # Unsampled placeholders carry zero q, recovering the full target p.
     if draft_probs is not None:
         recovered_dist = torch.clamp(
             target_probs - draft_probs.to(target_probs.dtype), min=0.0

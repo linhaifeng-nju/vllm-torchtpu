@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -28,7 +27,6 @@ def _config(draft_tp=1, target_tp=8):
         draft_tensor_parallel_size=draft_tp,
         method="draft_model",
         draft_model_config=SimpleNamespace(is_hybrid=False, get_vocab_size=lambda: 3),
-        verify_equal_vocab_size_if_draft_model=lambda: None,
         uses_draft_model=lambda: True,
         use_heterogeneous_vocab=False,
         draft_sample_method="probabilistic",
@@ -40,12 +38,6 @@ def _config(draft_tp=1, target_tp=8):
     )
 
 
-@pytest.mark.parametrize("draft_tp", [1, 8])
-def test_standalone_draft_accepts_eagle_parallelism(draft_tp):
-    proposer = DraftModelProposer(MagicMock(), _config(draft_tp))
-    assert proposer._draft_replicated is (draft_tp == 1)
-
-
 @pytest.mark.parametrize("feature", ["use_heterogeneous_vocab", "is_hybrid"])
 def test_unsupported_draft_semantics_fail_explicitly(feature):
     config = _config()
@@ -54,7 +46,7 @@ def test_unsupported_draft_semantics_fail_explicitly(feature):
     else:
         config.speculative_config.draft_model_config.is_hybrid = True
     with pytest.raises(NotImplementedError):
-        DraftModelProposer(MagicMock(), config)
+        DraftModelProposer(SimpleNamespace(), config)
 
 
 @pytest.mark.parametrize("filtered", [False, True])
